@@ -5,6 +5,8 @@
    Extracts IP addresses, ports, and verifies IP header checksum.
 */
 
+`timescale 1ns / 1ps
+
 module packet_parser (
     // System Signals
     input  logic        clk,
@@ -50,18 +52,17 @@ module packet_parser (
     logic [15:0] byte_cnt;        // General purpose byte counter
     logic [7:0]  prev_byte;       // Previous byte storage for 16-bit matching
 
-    logic [15:0] ip_len_bytes;    // Total Length extracted from IP Header
+    logic [15:0] ip_len_bytes;    // Header length in bytes (IHL * 4)
     logic [7:0]  captured_proto;  // Protocol field extracted from IP Header
 
     logic [7:0]  ip_hdr [0:59];   // Buffer to store IP header for checksum
     logic [15:0] ip_byte_cnt;     // Pointer within the IP header
 
     // Checksum Calculation Signals
-    logic [31:0] fold_stage_1, fold_stage_2, fold_stage_3;
-    logic [31:0] ip_sum_raw, ip_sum_folded;
+    logic [31:0] fold_stage_1, fold_stage_2;
     logic [15:0] hdr_checksum;    // Checksum field from the packet itself
     logic [15:0] calc_checksum;   // Calculated checksum result
-    logic [31:0] sum0, sum1;
+    logic [31:0] sum0;
 
     // Error & Output Control
     logic err_this_cycle;         // Instantaneous error flag
@@ -175,8 +176,8 @@ module packet_parser (
         end else begin
             current_state <= next_state;
 
-            // Checksum Flag Control
-            if (current_state == IDLE && valid_in) begin
+            // Checksum Flag Control (cleared at the first byte of every packet)
+            if ((current_state == IDLE || current_state == DONE) && valid_in) begin
                 checksum_ok_r <= 1'b0;
             end
 
@@ -195,11 +196,17 @@ module packet_parser (
             // IP Header Extraction
             if (current_state != PARSE_IP && next_state == PARSE_IP) begin
                 ip_byte_cnt <= 0;
-                for (k=0; k<60; k++) ip_hdr[k] <= 8'h00; // Clear buffer
             end else if (current_state == PARSE_IP && valid_in) begin
                 if (ip_byte_cnt < 60)
                     ip_hdr[ip_byte_cnt] <= data_in; // Capture byte for checksum
                 ip_byte_cnt <= ip_byte_cnt + 1;
+            end
+
+            // Clear the header buffer at the first byte of every packet, so a
+            // non-IPv4 / truncated frame can never be checked against the
+            // header of the previous packet.
+            if ((current_state == IDLE || current_state == DONE) && valid_in) begin
+                for (k=0; k<60; k++) ip_hdr[k] <= 8'h00;
             end
 
             // Error Flag Update
@@ -215,6 +222,10 @@ module packet_parser (
                     if (valid_in) begin
                         is_tcp       <= 0;
                         is_udp       <= 0;
+                        src_ip       <= 0;
+                        dst_ip       <= 0;
+                        src_port     <= 0;
+                        dst_port     <= 0;
                         prev_byte    <= data_in;
                         byte_cnt     <= 1;
                     end
@@ -269,28 +280,22 @@ module packet_parser (
                         prev_byte    <= data_in;
                         is_tcp       <= 0;
                         is_udp       <= 0;
+                        src_ip       <= 0;
+                        dst_ip       <= 0;
+                        src_port     <= 0;
+                        dst_port     <= 0;
                     end
                 end
             endcase
+
+            
         end
     end
 
-    // Checksum Logic: Folding (Sum 16-bit words)
-    integer i;
-    always @(*) begin
-        ip_sum_raw = 0;
-        for (i = 0; i < 60; i = i + 2) begin
-            if (i < ip_len_bytes)
-                ip_sum_raw = ip_sum_raw + {ip_hdr[i], ip_hdr[i+1]};
-        end
-        // Fold 32-bit sum to 16-bit
-        fold_stage_1  = ip_sum_raw[31:16] + ip_sum_raw[15:0];
-        fold_stage_2  = fold_stage_1[31:16] + fold_stage_1[15:0];
-        fold_stage_3  = fold_stage_2[31:16] + fold_stage_2[15:0];
-        ip_sum_folded = fold_stage_3;
-    end
-
-    // Checksum Logic: Calculation (Verify against header checksum)
+    // Checksum Logic (combinational): sum the 16-bit words of the buffered
+    // header (checksum field counted as 0), fold the carries twice, invert.
+    // Max sum is 30 words * 0xFFFF < 2^21, so two end-around-carry folds are
+    // always enough (no data-dependent loop -> synthesizable).
     integer j;
     always @(*) begin
         hdr_checksum = {ip_hdr[10], ip_hdr[11]};
@@ -303,11 +308,10 @@ module packet_parser (
             end
         end
 
-        sum1 = sum0;
-        while (sum1[31:16] != 0)
-            sum1 = sum1[15:0] + sum1[31:16];
+        fold_stage_1  = sum0[31:16] + sum0[15:0];
+        fold_stage_2  = fold_stage_1[31:16] + fold_stage_1[15:0];
 
-        calc_checksum = ~sum1[15:0];
+        calc_checksum = ~fold_stage_2[15:0];
     end
 
 endmodule

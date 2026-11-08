@@ -1,0 +1,21 @@
+VCD info: dumpfile dump.vcd opened for output.
+PASS: Valid TCP
+PASS: Corrupt Checksum
+PASS: Truncated Ethernet
+PASS: Truncated IP
+PASS: Valid TCP after error (b2b)
+PASS: Truncated L4
+PASS: ICMP (no TCP/UDP flag)
+PASS: Valid UDP
+PASS: Non-IPv4 EtherType
+PASS: Bad IP version
+PASS: Bad IHL
+PASS: IPv4 options (IHL=6) TCP
+PASS: Back-to-back #1 TCP
+PASS: Back-to-back #2 UDP
+PASS: exactly one parser_done pulse per packet (14)
+
+FINAL RESULTS: Pass=15, Fail=0
+TEST PASSED
+
+tb_packet_parser.sv:313: $finish called at 6485000 (1ps)

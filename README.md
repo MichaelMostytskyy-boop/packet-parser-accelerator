@@ -21,6 +21,7 @@ The core is a **6-state FSM** with a lightweight datapath for extraction and che
   - Compares against the checksum field in the header
 - **Robust error handling:**
   - Detects early termination of Ethernet/IP/L4 regions
+  - Clears extracted fields and the header buffer at the start of every packet, so a non-IPv4 frame is never checked against the previous packet's header
   - Rejects invalid IPv4 version / IHL
   - Safely drains unsupported traffic until `last_in`
 - **Stable sampling for verification:**
@@ -79,23 +80,24 @@ The parser uses 6 states:
    - `checksum_ok_r` is latched *exactly when entering DONE*
 
 ### 3.2 Pipeline & Latency Profile
-The parser operates as a streaming processor with minimal overhead. The latency from the last byte of a packet to the valid output is **1 clock cycle**.
+The parser operates as a streaming processor with minimal overhead. The latency from the clock edge that samples the last byte of a packet (`valid_in && last_in`) to `parser_done` is **1 clock cycle**: the FSM enters `DONE` and `checksum_ok` is latched on that same edge.
 
 **Textual Pipeline Diagram:**
 ```text
-Cycle n:      [data_in (Last Byte)] --> FSM: PARSE_L4/WAIT_END --> Latch Ports/IP
-Cycle n+1:    [FSM: DONE]           --> Checksum Calculated    --> valid_out (High)
+Cycle n:      [data_in (Last Byte)] --> FSM: PARSE_L4/WAIT_END --> checksum computed (combinational)
+Edge n+1:     FSM -> DONE, checksum_ok_r latched, ports/IPs held
+Cycle n+1:    [FSM: DONE]                                      --> parser_done (High)
                                                                --> checksum_ok (Latched)
 
 ```
 
 ## 4. Checksum Engine (IPv4 Header)
-Checksum logic is TB-matched and works as follows:
+The checksum logic works as follows:
 - Reads checksum field: `hdr_checksum = {ip_hdr[10], ip_hdr[11]}`
 - Sums 16-bit words across the IPv4 header
 - Treats the checksum field as `0x0000` during calculation
-- Folds carries until the upper 16 bits are zero
-- Takes 1’s complement: `calc_checksum = ~sum1[15:0]`
+- Folds the carries twice (end-around carry; two folds are always enough for a 60-byte header, so the logic is synthesizable)
+- Takes 1’s complement: `calc_checksum = ~fold_stage_2[15:0]`
 - `checksum_ok_r` is latched on transition into `DONE`:
 - `checksum_ok_r = (calc_checksum == hdr_checksum) && no_error`
 
@@ -140,20 +142,28 @@ To achieve higher clock frequencies , the combinational logic for checksum and f
 
 
 ## 6. Verification & Testing
-The included self-checking SystemVerilog testbench (`tb_packet_parser.sv`) generates Ethernet+IPv4 frames and validates behavior.
+The included self-checking SystemVerilog testbench (`tb_packet_parser.sv`) generates Ethernet+IPv4 frames and checks **all outputs** (`src_ip`, `dst_ip`, `src_port`, `dst_port`, `is_tcp`, `is_udp`, `checksum_ok`, `parser_error`) for every packet. A monitor records each `parser_done` pulse and the testbench checks there is exactly one per packet. It ends with `TEST PASSED` / `TEST FAILED`.
 
-### Functional Scenarios Verified
-1. **Valid TCP Stream**
-   - Verifies extracted IPs and checksum success
-2. **Corrupt Checksum Injection**
-   - Modifies checksum to ensure `checksum_ok` deasserts
-3. **Early Termination**
-   - Sends a short packet to ensure `parser_error` asserts
-4. **ICMP / Unsupported Protocol Handling**
-   - Ensures no TCP/UDP flags are asserted
-   - Parser drains until `last_in`
+### Functional Scenarios Verified (14 packets)
+1. **Valid TCP** and **Valid UDP** (IPs, ports, protocol flag, checksum OK)
+2. **Corrupt Checksum Injection** (`checksum_ok` = 0, fields still extracted, no `parser_error`)
+3. **Truncated Ethernet / IP / L4 regions** (`parser_error` = 1, `checksum_ok` = 0)
+4. **ICMP / Unsupported Protocol** (no TCP/UDP flag, checksum OK, drains until `last_in`)
+5. **Non-IPv4 EtherType, bad IP version, bad IHL** (fields stay 0, checksum not OK; `parser_error` for version/IHL)
+6. **IPv4 options** (IHL = 6, 24-byte header, ports taken after the options)
+7. **Back-to-back frames** with zero idle cycles, including a valid frame directly after an errored one (error recovery)
 
-![Simulation Waveforms](images/simulation_wave.png)
+### Results (Icarus Verilog)
+`TEST PASSED` (15 checks, 0 failures) — log in `results/icarus_clean.log`.
+
+### Simulation Waveforms
+**Valid TCP packet:** the IPs and ports are extracted as the bytes arrive, `is_tcp` rises at the end of the IP header, and `parser_done` and `checksum_ok` rise together one cycle after `last_in`.
+
+![Simulation Waveform - valid TCP](images/sim_wave.png)
+
+**Truncated frames and error recovery:** `parser_error` is raised for the truncated Ethernet and IP frames, `checksum_ok` stays low, and the valid frame sent right after the truncated IP frame (no idle cycle) is parsed correctly. The extracted fields are cleared at the start of each new packet.
+
+![Simulation Waveform - error and recovery](images/sim_wave_error.png)
 
 
 
